@@ -193,4 +193,10 @@ average model ranking table
 
 Total time elapsed: 7.26 seconds
 ```
+Here is a plot of the fit SPY return densities.
+![Alt text](/SPY.png)
+
+For the VIX "return" (percentage change) densities the skew is more apparent
+![Alt text](/VIX.png)
+
 
