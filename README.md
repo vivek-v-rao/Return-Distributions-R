@@ -79,7 +79,7 @@ Rscript xreturns_dist.r spy_vix.csv
 - Hyperbolic secant (Sech)
 - Generalized secant hyperbolic (GSH)
 - Generalized error distribution (GED)
-- Symmetric Student t (T)
+- Student t (T)
 
 ### Skewed or asymmetric families
 - Asymmetric Laplace (ALaplace)
@@ -103,7 +103,7 @@ Rscript xreturns_dist.r spy_vix.csv
 - Generalized hyperbolic (GH)
 - Champernowne (with `lambda` controlling sech/logistic limits)
 - Normal-Laplace
-- Generalized t (GT; McDonald–Newey)
+- Generalized t (GT; McDonaldâ€“Newey)
 - Skewed generalized t (SGT; Theodossiou)
 
 ## Output
@@ -127,3 +127,4 @@ Rscript xreturns_dist.r spy_vix.csv
 ```sh
 Rscript xreturns_dist.r spy_vix.csv
 ```
+
