@@ -16,10 +16,10 @@ models_to_fit <- c(
   "Normal",
   "Logistic",
   "EGB2",
+  "NIG",
   "Cauchy",
   "Laplace",
   "ALaplace",
-  "NIG",
   "Hyperbolic",
   "Champernowne",
   "NormalLaplace",
@@ -41,7 +41,8 @@ models_to_fit <- c(
   "FSSkewT",
   "JFSkewT"
 )
-max_models <- 2 # NA_integer_ # set to a positive integer to cap models
+# models_to_fit = "NEFGHS"
+max_models <- NA_integer_ # set to a non-negative integer to cap models
 do_density_plots <- TRUE
 do_kde_plot <- FALSE
 do_logcondens_plot <- FALSE
@@ -49,6 +50,13 @@ do_logspline_plot <- TRUE
 fixed_nu <- 5.0 # NA_real_
 ret_scale <- 100
 start_time <- proc.time()
+allowed_symbols <- character() # if non-empty, only use these asset columns
+max_symbols <- NA_integer_ # set to a non-negative integer to cap assets
+do_mean_ranking_table <- TRUE
+do_median_ranking_table <- TRUE
+min_ret_obs <- 5 # minimum number of finite returns required per symbol
+do_loglik_matrix <- TRUE
+loglik_csv <- "temp_loglik.csv" # if non-empty, write logLik matrix to this CSV
 
 #' Split a comma-separated environment variable into a trimmed character vector.
 split_env_list <- function(x) {
@@ -169,7 +177,8 @@ model_meta <- function() {
 #' Resolve models enabled by the user list and optional cap.
 enabled_models <- function() {
   base <- unique(models_to_fit)
-  if (is.finite(max_models) && max_models > 0) {
+  if (is.finite(max_models)) {
+    if (max_models <= 0) return(character())
     base <- base[seq_len(min(length(base), max_models))]
   }
   base
@@ -368,12 +377,18 @@ fit_alaplace <- function(x) {
 }
 
 #' Negative log-likelihood for NIG.
-nig_nll <- function(par, x) {
+nig_nll <- function(par, x, delta_bounds = NULL, alpha_bounds = NULL) {
   mu <- par[1]
   delta <- exp(par[2])
   alpha <- exp(par[3])
   eta <- par[4]
   beta <- alpha * tanh(eta)
+  if (!is.null(delta_bounds)) {
+    if (delta < delta_bounds[1] || delta > delta_bounds[2]) return(Inf)
+  }
+  if (!is.null(alpha_bounds)) {
+    if (alpha < alpha_bounds[1] || alpha > alpha_bounds[2]) return(Inf)
+  }
   ll <- nig_logpdf(x, alpha, beta, delta, mu)
   if (any(!is.finite(ll))) return(Inf)
   -sum(ll)
@@ -384,20 +399,36 @@ fit_nig <- function(x) {
   mu0 <- mean(x)
   med0 <- median(x)
   sigma0 <- sd(x)
-  alpha0 <- if (is.finite(sigma0) && sigma0 > 0) 1 / sigma0 else 1
-  delta0 <- if (is.finite(sigma0) && sigma0 > 0) sigma0 else 1
+  if (!is.finite(sigma0) || sigma0 <= 0) return(NULL)
+  alpha0 <- 1 / sigma0
+  delta0 <- sigma0
+  delta_bounds <- c(delta0 * 1e-3, delta0 * 1e3)
+  alpha_bounds <- c(alpha0 * 1e-3, alpha0 * 1e3)
+  log_delta_bounds <- log(delta_bounds)
+  log_alpha_bounds <- log(alpha_bounds)
   starts <- list(
     c(mu0, log(delta0), log(alpha0), 0),
     c(med0, log(delta0), log(alpha0 * 2), 0)
   )
-  methods <- c("BFGS", "Nelder-Mead")
+  methods <- c("L-BFGS-B")
   best <- NULL
 
   for (par0 in starts) {
     for (method in methods) {
-      opt <- try(optim(par0, nig_nll, x = x, method = method), silent = TRUE)
+      if (method == "L-BFGS-B") {
+        lower <- c(-Inf, log_delta_bounds[1], log_alpha_bounds[1], -Inf)
+        upper <- c(Inf, log_delta_bounds[2], log_alpha_bounds[2], Inf)
+        opt <- try(optim(
+          par0, nig_nll, x = x, method = method, lower = lower, upper = upper,
+          delta_bounds = delta_bounds, alpha_bounds = alpha_bounds
+        ), silent = TRUE)
+      } else {
+        opt <- try(optim(par0, nig_nll, x = x, method = method,
+                         delta_bounds = delta_bounds, alpha_bounds = alpha_bounds), silent = TRUE)
+      }
       if (inherits(opt, "try-error")) next
       if (!is.finite(opt$value)) next
+      if (!is.null(opt$convergence) && opt$convergence != 0) next
       if (is.null(best) || opt$value < best$value) best <- opt
     }
   }
@@ -408,7 +439,11 @@ fit_nig <- function(x) {
   delta <- exp(par[2])
   alpha <- exp(par[3])
   beta <- alpha * tanh(par[4])
-  list(mu = mu, delta = delta, alpha = alpha, beta = beta, logLik = -best$value, convergence = best$convergence)
+  logLik <- -best$value
+  if (!is.finite(logLik)) return(NULL)
+  if (delta < delta_bounds[1] || delta > delta_bounds[2]) return(NULL)
+  if (alpha < alpha_bounds[1] || alpha > alpha_bounds[2]) return(NULL)
+  list(mu = mu, delta = delta, alpha = alpha, beta = beta, logLik = logLik, convergence = best$convergence)
 }
 
 #' Negative log-likelihood for Hyperbolic.
@@ -1007,11 +1042,20 @@ fit_sgsh <- function(x) {
 }
 
 #' Negative log-likelihood for NEF-GHS.
-nef_ghs_nll <- function(par, x) {
+nef_ghs_nll <- function(par, x, sigma_bounds = NULL, lambda_bounds = NULL, beta_bounds = NULL) {
   mu <- par[1]
   sigma <- exp(par[2])
   lambda <- exp(par[3])
   beta <- par[4]
+  if (!is.null(sigma_bounds)) {
+    if (sigma < sigma_bounds[1] || sigma > sigma_bounds[2]) return(Inf)
+  }
+  if (!is.null(lambda_bounds)) {
+    if (lambda < lambda_bounds[1] || lambda > lambda_bounds[2]) return(Inf)
+  }
+  if (!is.null(beta_bounds)) {
+    if (beta < beta_bounds[1] || beta > beta_bounds[2]) return(Inf)
+  }
   ll <- nef_ghs_logpdf(x, mu, sigma, lambda, beta)
   if (any(!is.finite(ll))) return(Inf)
   -sum(ll)
@@ -1024,20 +1068,30 @@ fit_nef_ghs <- function(x) {
   sigma0 <- sd(x)
   mad0 <- mad(x)
   lambda0 <- 0.5
+  if (!is.finite(sigma0) || sigma0 <= 0) return(NULL)
+  sigma_bounds <- c(sigma0 * 1e-3, sigma0 * 1e3)
+  lambda_bounds <- c(0.05, 50)
+  beta_bounds <- c(-10, 10)
   starts <- list(
     c(mu0, log(sigma0), log(lambda0), 0),
     c(med0, log(ifelse(is.finite(mad0) && mad0 > 0, mad0 * 1.4826, sigma0)), log(1), 0),
     c(mu0, log(sigma0), log(2), 0.5),
     c(mu0, log(sigma0), log(2), -0.5)
   )
-  methods <- c("BFGS", "Nelder-Mead")
+  methods <- c("L-BFGS-B")
   best <- NULL
 
   for (par0 in starts) {
     for (method in methods) {
-      opt <- try(optim(par0, nef_ghs_nll, x = x, method = method), silent = TRUE)
+      lower <- c(-Inf, log(sigma_bounds[1]), log(lambda_bounds[1]), beta_bounds[1])
+      upper <- c(Inf, log(sigma_bounds[2]), log(lambda_bounds[2]), beta_bounds[2])
+      opt <- try(optim(
+        par0, nef_ghs_nll, x = x, method = method, lower = lower, upper = upper,
+        sigma_bounds = sigma_bounds, lambda_bounds = lambda_bounds, beta_bounds = beta_bounds
+      ), silent = TRUE)
       if (inherits(opt, "try-error")) next
       if (!is.finite(opt$value)) next
+      if (!is.null(opt$convergence) && opt$convergence != 0) next
       if (is.null(best) || opt$value < best$value) best <- opt
     }
   }
@@ -1048,7 +1102,12 @@ fit_nef_ghs <- function(x) {
   sigma <- exp(par[2])
   lambda <- exp(par[3])
   beta <- par[4]
-  list(mu = mu, sigma = sigma, lambda = lambda, beta = beta, logLik = -best$value, convergence = best$convergence)
+  logLik <- -best$value
+  if (!is.finite(logLik)) return(NULL)
+  if (sigma < sigma_bounds[1] || sigma > sigma_bounds[2]) return(NULL)
+  if (lambda < lambda_bounds[1] || lambda > lambda_bounds[2]) return(NULL)
+  if (beta < beta_bounds[1] || beta > beta_bounds[2]) return(NULL)
+  list(mu = mu, sigma = sigma, lambda = lambda, beta = beta, logLik = logLik, convergence = best$convergence)
 }
 #' Negative log-likelihood for hyperbolic secant.
 sech_nll <- function(par, x) {
@@ -1128,6 +1187,49 @@ nct_nll <- function(par, x, fixed_nu) {
   -sum(nct_logpdf(x, mu, sigma, nu, ncp))
 }
 
+#' Negative log-likelihood for symmetric t distribution.
+t_sym_nll <- function(par, x, fixed_nu = NA_real_) {
+  mu <- par[1]
+  sigma <- exp(par[2])
+  if (!is.finite(sigma) || sigma <= 0) return(Inf)
+  nu <- if (is.finite(fixed_nu)) fixed_nu else 2 + exp(par[3])
+  ll <- dt((x - mu) / sigma, df = nu, log = TRUE) - log(sigma)
+  if (any(!is.finite(ll))) return(Inf)
+  -sum(ll)
+}
+
+#' Fit symmetric t distribution by MLE.
+fit_t_sym <- function(x, fixed_nu = NA_real_) {
+  mu0 <- mean(x)
+  sigma0 <- sd(x)
+  if (!is.finite(sigma0) || sigma0 <= 0) return(NULL)
+  nu0 <- if (is.finite(fixed_nu)) fixed_nu else 8
+  if (is.finite(fixed_nu)) {
+    par0 <- c(mu0, log(sigma0))
+    opt <- try(optim(par0, t_sym_nll, x = x, fixed_nu = fixed_nu, method = "BFGS"), silent = TRUE)
+  } else {
+    par0 <- c(mu0, log(sigma0), log(max(nu0 - 2, 1e-3)))
+    opt <- try(optim(par0, t_sym_nll, x = x, fixed_nu = fixed_nu, method = "BFGS"), silent = TRUE)
+  }
+  if (inherits(opt, "try-error")) return(NULL)
+  if (!is.null(opt$convergence) && opt$convergence != 0) return(NULL)
+  par <- opt$par
+  mu <- par[1]
+  sigma <- exp(par[2])
+  nu <- if (is.finite(fixed_nu)) fixed_nu else 2 + exp(par[3])
+  logLik <- -opt$value
+  if (!is.finite(logLik)) return(NULL)
+  list(mu = mu, sigma = sigma, nu = nu, logLik = logLik)
+}
+
+#' Moments for symmetric t distribution (excess kurtosis).
+t_sym_moments <- function(mu, sigma, nu) {
+  mean_val <- if (is.finite(nu) && nu > 1) mu else NA_real_
+  sd_val <- if (is.finite(nu) && nu > 2) sigma * sqrt(nu / (nu - 2)) else NA_real_
+  kurt_val <- if (is.finite(nu) && nu > 4) 6 / (nu - 4) else NA_real_
+  list(mean = mean_val, sd = sd_val, skew = 0, kurtosis = kurt_val)
+}
+
 #' Fit non-central t distribution by MLE.
 fit_nct <- function(x, fixed_nu) {
   mu0 <- mean(x)
@@ -1166,11 +1268,87 @@ quiet_selm <- function(expr) {
   out
 }
 
+#' Negative log-likelihood for skew-normal using sn::dsn.
+sn_skewnorm_nll <- function(par, x) {
+  xi <- par[1]
+  omega <- exp(par[2])
+  alpha <- par[3]
+  if (!is.finite(omega) || omega <= 0) return(Inf)
+  ll <- sn::dsn(x, xi = xi, omega = omega, alpha = alpha, log = TRUE)
+  if (any(!is.finite(ll))) return(Inf)
+  -sum(ll)
+}
+
+#' Fit skew-normal by MLE using sn::dsn.
+fit_skewnorm_mle <- function(x) {
+  mu0 <- mean(x)
+  sd0 <- sd(x)
+  if (!is.finite(sd0) || sd0 <= 0) return(NULL)
+  par0 <- c(mu0, log(sd0), 0)
+  methods <- c("BFGS", "Nelder-Mead")
+  best <- NULL
+  for (method in methods) {
+    opt <- try(optim(par0, sn_skewnorm_nll, x = x, method = method), silent = TRUE)
+    if (inherits(opt, "try-error")) next
+    if (!is.finite(opt$value)) next
+    if (is.null(best) || opt$value < best$value) best <- opt
+  }
+  if (is.null(best)) return(NULL)
+  par <- best$par
+  xi <- par[1]
+  omega <- exp(par[2])
+  alpha <- par[3]
+  logLik <- -best$value
+  if (!is.finite(logLik)) return(NULL)
+  list(dp = c(xi, omega, alpha), logLik = logLik)
+}
+
+#' Negative log-likelihood for skew-t using sn::dst.
+sn_skewt_nll <- function(par, x, fixed_nu = NA_real_) {
+  xi <- par[1]
+  omega <- exp(par[2])
+  alpha <- par[3]
+  nu <- if (is.finite(fixed_nu)) fixed_nu else 2 + exp(par[4])
+  if (!is.finite(omega) || omega <= 0 || !is.finite(nu) || nu <= 0) return(Inf)
+  ll <- sn::dst(x, xi = xi, omega = omega, alpha = alpha, nu = nu, log = TRUE)
+  if (any(!is.finite(ll))) return(Inf)
+  -sum(ll)
+}
+
+#' Fit skew-t by MLE using sn::dst.
+fit_skewt_mle <- function(x, fixed_nu = NA_real_) {
+  mu0 <- mean(x)
+  sd0 <- sd(x)
+  if (!is.finite(sd0) || sd0 <= 0) return(NULL)
+  if (is.finite(fixed_nu)) {
+    par0 <- c(mu0, log(sd0), 0)
+  } else {
+    par0 <- c(mu0, log(sd0), 0, log(6))
+  }
+  methods <- c("BFGS", "Nelder-Mead")
+  best <- NULL
+  for (method in methods) {
+    opt <- try(optim(par0, sn_skewt_nll, x = x, fixed_nu = fixed_nu, method = method), silent = TRUE)
+    if (inherits(opt, "try-error")) next
+    if (!is.finite(opt$value)) next
+    if (is.null(best) || opt$value < best$value) best <- opt
+  }
+  if (is.null(best)) return(NULL)
+  par <- best$par
+  xi <- par[1]
+  omega <- exp(par[2])
+  alpha <- par[3]
+  nu <- if (is.finite(fixed_nu)) fixed_nu else 2 + exp(par[4])
+  logLik <- -best$value
+  if (!is.finite(logLik)) return(NULL)
+  list(dp = c(xi, omega, alpha, nu), logLik = logLik)
+}
+
 # ----------------------------
 # package checks
 # ----------------------------
 require_pkg <- function(pkg, purpose) {
-  if (!requireNamespace(pkg, quietly = TRUE)) {
+  if (!suppressPackageStartupMessages(requireNamespace(pkg, quietly = TRUE))) {
     stop(sprintf("package '%s' is required for %s", pkg, purpose))
   }
 }
@@ -1186,7 +1364,7 @@ require_pkg("tseries", "Jarque-Bera p-values")
 require_pkg("fBasics", "D'Agostino p-values")
 require_pkg("nortest", "Anderson-Darling p-values")
 
-library("sn")
+suppressPackageStartupMessages(library("sn"))
 
 # ----------------------------
 # input
@@ -1210,6 +1388,16 @@ df$Date <- as.Date(df$Date)
 df <- df[order(df$Date), , drop = FALSE]
 
 asset_names <- unique(setdiff(names(df), "Date"))
+if (length(allowed_symbols) > 0) {
+  asset_names <- asset_names[asset_names %in% allowed_symbols]
+}
+if (is.finite(max_symbols)) {
+  if (max_symbols <= 0) {
+    asset_names <- character()
+  } else {
+    asset_names <- asset_names[seq_len(min(length(asset_names), max_symbols))]
+  }
+}
 if (length(asset_names) != length(setdiff(names(df), "Date"))) {
   warning("duplicate asset column names detected; using unique names only")
 }
@@ -1221,7 +1409,8 @@ for (nm in asset_names) {
 }
 
 cat(sprintf("file: %s\n", infile))
-cat(sprintf("rows: %d  date range: %s to %s\n",
+cat("symbols:", ncol(df))
+cat(sprintf("\ndates: %d  date range: %s to %s\n",
             nrow(df), as.character(min(df$Date, na.rm = TRUE)), as.character(max(df$Date, na.rm = TRUE))))
 cat(sprintf("return_type: %s\n", return_type))
 cat(sprintf("ret_scale: %g\n", ret_scale))
@@ -1241,6 +1430,18 @@ for (nm in asset_names) {
   r <- compute_returns(p, type = return_type)
   r <- r * ret_scale
   ret_list[[nm]] <- r
+}
+
+# filter symbols by minimum finite return count
+if (is.finite(min_ret_obs) && min_ret_obs > 0) {
+  ret_counts <- sapply(ret_list, function(x) sum(is.finite(x)))
+  excluded <- names(ret_counts)[ret_counts < min_ret_obs]
+  if (length(excluded) > 0) {
+    cat(sprintf("excluded symbols (n < %d): %s\n", min_ret_obs, paste(excluded, collapse = ", ")))
+  }
+  keep <- names(ret_counts)[ret_counts >= min_ret_obs]
+  asset_names <- intersect(asset_names, keep)
+  ret_list <- ret_list[asset_names]
 }
 
 # ----------------------------
@@ -2183,7 +2384,7 @@ if (is_enabled("NEFGHS")) {
 if (is_enabled("T")) {
   t_model <- proc.time()
   # ----------------------------
-  # symmetric t fits per asset (Azzalini, alpha=0)
+  # symmetric t fits per asset
   # ----------------------------
   fit_rows <- list()
   for (nm in asset_names) {
@@ -2193,57 +2394,31 @@ if (is_enabled("T")) {
       warning(sprintf("asset %s has too few finite returns for t fit", nm))
       next
     }
-    fixed_list <- list(alpha = 0)
-    if (is.finite(fixed_nu)) fixed_list$nu <- fixed_nu
-    fit <- quiet_selm(sn::selm(r ~ 1, family = "ST", fixed.param = fixed_list, control = list(trace = 0)))
-    if (inherits(fit, "try-error")) {
+    fit <- fit_t_sym(r, fixed_nu = fixed_nu)
+    if (is.null(fit)) {
       warning(sprintf("asset %s t fit failed", nm))
       next
     }
-    dp <- fit@param$dp
-    nu <- dp[4]
-    if (!is.finite(nu) && is.finite(fixed_nu)) nu <- fixed_nu
-    dp_mom <- c(dp[1], dp[2], 0, nu)
-    moments <- st_moments(dp_mom, nu)
-    mean_val <- moments$mean
-    sd_val <- moments$sd
-    skew_val <- 0
-    kurt_val <- moments$kurtosis
-    n_obs <- length(r)
-    k <- length(dp)
-    ll <- as.numeric(logLik(fit))
-    metrics <- fit_metrics(ll, k, n_obs)
-    nu_out <- if (is.finite(dp[4])) dp[4] else if (is.finite(fixed_nu)) fixed_nu else NA_real_
+    moments <- t_sym_moments(fit$mu, fit$sigma, fit$nu)
+    k <- if (is.finite(fixed_nu)) 2 else 3
+    metrics <- fit_metrics(fit$logLik, k, length(r))
     fit_rows[[nm]] <- data.frame(
       asset = nm,
-      xi = dp[1],
-      omega = dp[2],
-      nu = nu_out,
-      mean = mean_val,
-      sd = sd_val,
-      skew = skew_val,
-      kurtosis = kurt_val,
-      logLik = ll,
+      xi = fit$mu,
+      omega = fit$sigma,
+      nu = fit$nu,
+      mean = moments$mean,
+      sd = moments$sd,
+      skew = moments$skew,
+      kurtosis = moments$kurtosis,
+      logLik = fit$logLik,
       AIC = metrics$AIC,
       BIC = metrics$BIC,
       stringsAsFactors = FALSE
     )
-    dp_full <- if (is.finite(nu_out)) {
-      if (length(dp) == 2) {
-        c(dp[1], dp[2], 0, nu_out)
-      } else if (length(dp) == 3) {
-        c(dp[1], dp[2], 0, nu_out)
-      } else if (length(dp) >= 4) {
-        dp[1:4]
-      } else {
-        NA_real_
-      }
-    } else {
-      NA_real_
-    }
-    fit_params$T[[nm]] <- list(dp = dp_full)
-    add_fit_metrics("T", nm, ll, metrics$AIC, metrics$BIC)
-    add_fit_moments("T", nm, mean_val, sd_val, skew_val, kurt_val)
+    fit_params$T[[nm]] <- list(mu = fit$mu, sigma = fit$sigma, nu = fit$nu)
+    add_fit_metrics("T", nm, fit$logLik, metrics$AIC, metrics$BIC)
+    add_fit_moments("T", nm, moments$mean, moments$sd, moments$skew, moments$kurtosis)
   }
   fit_tab <- do.call(rbind, fit_rows)
   rownames(fit_tab) <- NULL
@@ -2315,7 +2490,18 @@ if (is_enabled("SkewNormal")) {
       next
     }
     fit <- quiet_selm(sn::selm(r ~ 1, family = "SN", control = list(trace = 0)))
-    dp <- fit@param$dp
+    if (is.null(fit) || inherits(fit, "try-error")) {
+      fit_alt <- fit_skewnorm_mle(r)
+      if (is.null(fit_alt)) {
+        warning(sprintf("asset %s skew-normal fit failed", nm))
+        next
+      }
+      dp <- fit_alt$dp
+      ll <- fit_alt$logLik
+    } else {
+      dp <- fit@param$dp
+      ll <- as.numeric(logLik(fit))
+    }
     cp <- sn::dp2cp(dp, family = "SN")
     kurt <- cp[4]
     if (is.na(kurt)) {
@@ -2323,7 +2509,6 @@ if (is_enabled("SkewNormal")) {
     }
     n_obs <- length(r)
     k <- length(dp)
-    ll <- as.numeric(logLik(fit))
     metrics <- fit_metrics(ll, k, n_obs)
     fit_rows[[nm]] <- data.frame(
       asset = nm,
@@ -2367,17 +2552,24 @@ if (is_enabled("SkewT")) {
     fixed_list <- NULL
     if (is.finite(fixed_nu)) fixed_list <- list(nu = fixed_nu)
     fit <- quiet_selm(sn::selm(r ~ 1, family = "ST", fixed.param = fixed_list, control = list(trace = 0)))
-    if (inherits(fit, "try-error")) {
-      warning(sprintf("asset %s skew-t fit failed", nm))
-      next
+    if (is.null(fit) || inherits(fit, "try-error")) {
+      fit_alt <- fit_skewt_mle(r, fixed_nu = fixed_nu)
+      if (is.null(fit_alt)) {
+        warning(sprintf("asset %s skew-t fit failed", nm))
+        next
+      }
+      dp <- fit_alt$dp
+      nu <- dp[4]
+      ll <- fit_alt$logLik
+    } else {
+      dp <- fit@param$dp
+      nu <- dp[4]
+      ll <- as.numeric(logLik(fit))
     }
-    dp <- fit@param$dp
-    nu <- dp[4]
     if (!is.finite(nu) && is.finite(fixed_nu)) nu <- fixed_nu
     moments <- st_moments(dp, nu)
     n_obs <- length(r)
     k <- length(dp)
-    ll <- as.numeric(logLik(fit))
     metrics <- fit_metrics(ll, k, n_obs)
     nu_out <- if (is.finite(dp[4])) dp[4] else if (is.finite(fixed_nu)) fixed_nu else NA_real_
     fit_rows[[nm]] <- data.frame(
@@ -2749,6 +2941,8 @@ if (length(aic_rows) > 0) {
                      idvar = "asset", timevar = "model", direction = "wide")
   bic_tab <- reshape(aic_df[, c("asset", "model", "BIC")],
                      idvar = "asset", timevar = "model", direction = "wide")
+  loglik_tab <- reshape(aic_df[, c("asset", "model", "logLik")],
+                        idvar = "asset", timevar = "model", direction = "wide")
   best_aic <- by(aic_df, aic_df$asset, function(d) d$model_chr[which.min(d$AIC)])
   best_bic <- by(aic_df, aic_df$asset, function(d) d$model_chr[which.min(d$BIC)])
   aic_tab$best_model <- as.character(best_aic[aic_tab$asset])
@@ -2757,6 +2951,34 @@ if (length(aic_rows) > 0) {
   bic_tab <- bic_tab[, c("asset", "best_model", setdiff(names(bic_tab), c("asset", "best_model")))]
   aic_tab[is.na(aic_tab)] <- NA_real_
   bic_tab[is.na(bic_tab)] <- NA_real_
+  if (isTRUE(do_loglik_matrix)) {
+    names(loglik_tab) <- sub("^logLik\\.", "", names(loglik_tab))
+    cat("\nlogLik matrix\n")
+    print(format_table(loglik_tab, digits = 4), row.names = FALSE)
+  }
+  if (nzchar(loglik_csv)) {
+    names(loglik_tab) <- sub("^logLik\\.", "", names(loglik_tab))
+    write.csv(loglik_tab, loglik_csv, row.names = FALSE, quote = FALSE)
+    cat(sprintf("\nwrote logLik matrix: %s\n", loglik_csv))
+  }
+
+  if (isTRUE(do_loglik_matrix)) {
+    loglik_summary <- aggregate(
+      aic_df$logLik,
+      by = list(model = aic_df$model_chr),
+      FUN = function(x) c(
+        median = median(x, na.rm = TRUE),
+        mean = mean(x, na.rm = TRUE),
+        sd = sd(x, na.rm = TRUE),
+        min = min(x, na.rm = TRUE),
+        max = max(x, na.rm = TRUE)
+      )
+    )
+    loglik_summary <- do.call(data.frame, loglik_summary)
+    names(loglik_summary) <- c("model", "median", "mean", "sd", "min", "max")
+    cat("\nlogLik summary by model\n")
+    print(format_table(loglik_summary, digits = 4), row.names = FALSE)
+  }
 
   cat("\nAIC summary table\n")
   aic_tab_print <- format_table(aic_tab, digits = 4)
@@ -2766,81 +2988,113 @@ if (length(aic_rows) > 0) {
   bic_tab_print <- format_table(bic_tab, digits = 4)
   print(bic_tab_print, row.names = FALSE)
 
-  for (nm in unique(aic_df$asset)) {
-    d <- aic_df[aic_df$asset == nm & is.finite(aic_df$logLik), ]
-    if (nrow(d) == 0) next
+  if (length(unique(aic_df$model_chr)) > 1) {
+    for (nm in unique(aic_df$asset)) {
+      d <- aic_df[aic_df$asset == nm & is.finite(aic_df$logLik), ]
+      if (nrow(d) == 0) next
 
-    ord_ll <- d[order(-d$logLik), ]
-    ord_aic <- d[order(d$AIC), ]
-    ord_bic <- d[order(d$BIC), ]
+      ord_ll <- d[order(-d$logLik), ]
+      ord_aic <- d[order(d$AIC), ]
+      ord_bic <- d[order(d$BIC), ]
 
-    rank_tab <- data.frame(
-      logLik_model = ord_ll$model_chr,
-      AIC_model = ord_aic$model_chr,
-      BIC_model = ord_bic$model_chr,
-      dLogLik = ord_ll$logLik[1] - ord_ll$logLik,
-      dAIC = ord_aic$AIC - ord_aic$AIC[1],
-      dBIC = ord_bic$BIC - ord_bic$BIC[1],
-      stringsAsFactors = FALSE
-    )
-    cat(sprintf("\nmodel ranking table: %s\n", nm))
-    rank_tab_print <- format_table(rank_tab, digits = 4)
-    print(rank_tab_print, row.names = FALSE)
-  }
-
-  delta_rows <- lapply(split(aic_df, aic_df$asset), function(d) {
-    d <- d[is.finite(d$logLik), ]
-    if (nrow(d) == 0) return(NULL)
-    best_ll <- max(d$logLik, na.rm = TRUE)
-    best_aic <- min(d$AIC, na.rm = TRUE)
-    best_bic <- min(d$BIC, na.rm = TRUE)
-    data.frame(
-      model = d$model_chr,
-      dLogLik = best_ll - d$logLik,
-      dAIC = d$AIC - best_aic,
-      dBIC = d$BIC - best_bic,
-      stringsAsFactors = FALSE
-    )
-  })
-  delta_df <- do.call(rbind, delta_rows)
-  if (!is.null(delta_df) && nrow(delta_df) > 0) {
-    avg_tab <- aggregate(
-      delta_df[, c("dLogLik", "dAIC", "dBIC")],
-      by = list(model = delta_df$model),
-      FUN = function(x) mean(x, na.rm = TRUE)
-    )
-    moments_df <- if (length(fit_moments) > 0) {
-      do.call(rbind, fit_moments)
-    } else {
-      data.frame(model = character(), mean = numeric(), sd = numeric(), skew = numeric(), kurtosis = numeric(), stringsAsFactors = FALSE)
+      rank_tab <- data.frame(
+        logLik_model = ord_ll$model_chr,
+        AIC_model = ord_aic$model_chr,
+        BIC_model = ord_bic$model_chr,
+        dLogLik = ord_ll$logLik[1] - ord_ll$logLik,
+        dAIC = ord_aic$AIC - ord_aic$AIC[1],
+        dBIC = ord_bic$BIC - ord_bic$BIC[1],
+        stringsAsFactors = FALSE
+      )
+      cat(sprintf("\nmodel ranking table: %s\n", nm))
+      rank_tab_print <- format_table(rank_tab, digits = 4)
+      print(rank_tab_print, row.names = FALSE)
     }
-    avg_moments <- if (nrow(moments_df) > 0) {
-      aggregate(
-        moments_df[, c("mean", "sd", "skew", "kurtosis")],
-        by = list(model = moments_df$model),
+
+    delta_rows <- lapply(split(aic_df, aic_df$asset), function(d) {
+      d <- d[is.finite(d$logLik), ]
+      if (nrow(d) == 0) return(NULL)
+      best_ll <- max(d$logLik, na.rm = TRUE)
+      best_aic <- min(d$AIC, na.rm = TRUE)
+      best_bic <- min(d$BIC, na.rm = TRUE)
+      data.frame(
+        model = d$model_chr,
+        dLogLik = best_ll - d$logLik,
+        dAIC = d$AIC - best_aic,
+        dBIC = d$BIC - best_bic,
+        stringsAsFactors = FALSE
+      )
+    })
+    delta_df <- do.call(rbind, delta_rows)
+    if (!is.null(delta_df) && nrow(delta_df) > 0) {
+      avg_tab <- aggregate(
+        delta_df[, c("dLogLik", "dAIC", "dBIC")],
+        by = list(model = delta_df$model),
         FUN = function(x) mean(x, na.rm = TRUE)
       )
-    } else {
-      data.frame(model = character(), mean = numeric(), sd = numeric(), skew = numeric(), kurtosis = numeric(), stringsAsFactors = FALSE)
+      moments_df <- if (length(fit_moments) > 0) {
+        do.call(rbind, fit_moments)
+      } else {
+        data.frame(model = character(), mean = numeric(), sd = numeric(), skew = numeric(), kurtosis = numeric(), stringsAsFactors = FALSE)
+      }
+      avg_moments <- if (nrow(moments_df) > 0) {
+        aggregate(
+          moments_df[, c("mean", "sd", "skew", "kurtosis")],
+          by = list(model = moments_df$model),
+          FUN = function(x) mean(x, na.rm = TRUE)
+        )
+      } else {
+        data.frame(model = character(), mean = numeric(), sd = numeric(), skew = numeric(), kurtosis = numeric(), stringsAsFactors = FALSE)
+      }
+      meta <- model_meta()
+      times_df <- if (length(model_times) > 0) {
+        data.frame(model = names(model_times), time_sec = unlist(model_times), stringsAsFactors = FALSE)
+      } else {
+        data.frame(model = character(), time_sec = numeric(), stringsAsFactors = FALSE)
+      }
+      avg_tab <- merge(avg_tab, meta, by = "model", all.x = TRUE)
+      avg_tab <- merge(avg_tab, avg_moments, by = "model", all.x = TRUE)
+      avg_tab <- merge(avg_tab, times_df, by = "model", all.x = TRUE)
+      avg_tab <- avg_tab[order(avg_tab$dAIC), ]
+      keep_cols <- c("model", "dLogLik", "dAIC", "dBIC", "k", "mean", "sd", "skew", "kurtosis", "time_sec")
+      for (col in keep_cols) {
+        if (!col %in% names(avg_tab)) avg_tab[[col]] <- NA_real_
+      }
+      avg_tab <- avg_tab[, keep_cols]
+      if (isTRUE(do_mean_ranking_table)) {
+        cat("\naverage model ranking table\n")
+        avg_tab_print <- format_table(avg_tab, digits = 4, integer_cols = "k")
+        print(avg_tab_print, row.names = FALSE)
+      }
+
+      if (isTRUE(do_median_ranking_table)) {
+        med_tab <- aggregate(
+          delta_df[, c("dLogLik", "dAIC", "dBIC")],
+          by = list(model = delta_df$model),
+          FUN = function(x) median(x, na.rm = TRUE)
+        )
+        med_moments <- if (nrow(moments_df) > 0) {
+          aggregate(
+            moments_df[, c("mean", "sd", "skew", "kurtosis")],
+            by = list(model = moments_df$model),
+            FUN = function(x) median(x, na.rm = TRUE)
+          )
+        } else {
+          data.frame(model = character(), mean = numeric(), sd = numeric(), skew = numeric(), kurtosis = numeric(), stringsAsFactors = FALSE)
+        }
+        med_tab <- merge(med_tab, meta, by = "model", all.x = TRUE)
+        med_tab <- merge(med_tab, med_moments, by = "model", all.x = TRUE)
+        med_tab <- merge(med_tab, times_df, by = "model", all.x = TRUE)
+        med_tab <- med_tab[order(med_tab$dAIC), ]
+        for (col in keep_cols) {
+          if (!col %in% names(med_tab)) med_tab[[col]] <- NA_real_
+        }
+        med_tab <- med_tab[, keep_cols]
+        cat("\nmedian model ranking table\n")
+        med_tab_print <- format_table(med_tab, digits = 4, integer_cols = "k")
+        print(med_tab_print, row.names = FALSE)
+      }
     }
-    meta <- model_meta()
-    times_df <- if (length(model_times) > 0) {
-      data.frame(model = names(model_times), time_sec = unlist(model_times), stringsAsFactors = FALSE)
-    } else {
-      data.frame(model = character(), time_sec = numeric(), stringsAsFactors = FALSE)
-    }
-    avg_tab <- merge(avg_tab, meta, by = "model", all.x = TRUE)
-    avg_tab <- merge(avg_tab, avg_moments, by = "model", all.x = TRUE)
-    avg_tab <- merge(avg_tab, times_df, by = "model", all.x = TRUE)
-    avg_tab <- avg_tab[order(avg_tab$dAIC), ]
-    keep_cols <- c("model", "dLogLik", "dAIC", "dBIC", "k", "mean", "sd", "skew", "kurtosis", "time_sec")
-    for (col in keep_cols) {
-      if (!col %in% names(avg_tab)) avg_tab[[col]] <- NA_real_
-    }
-    avg_tab <- avg_tab[, keep_cols]
-    cat("\naverage model ranking table\n")
-    avg_tab_print <- format_table(avg_tab, digits = 4, integer_cols = "k")
-    print(avg_tab_print, row.names = FALSE)
   }
 }
 
