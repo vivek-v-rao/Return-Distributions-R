@@ -11,6 +11,7 @@ Fit a broad set of univariate return distributions to asset return series, compa
 ## Files
 
 - `xreturns_dist.r`: main fitting script
+- `xcompare_dist.r`: another fitting script with some other distributions
 - `xsim_dist.r`: simulation-based model selection test harness
 - `return_utils.r`: return computation + summary stats helpers
 - `dist_utils.r`: distribution log-pdf/moments/metrics utilities
